@@ -20,7 +20,6 @@
 
 #ifdef OGLRENDERER_ENABLED
 #include "GPU3D.h"
-#include "GPU_OpenGL.h"
 #include "OpenGLSupport.h"
 
 namespace melonDS
@@ -30,6 +29,7 @@ class GPU;
 class GLRenderer : public Renderer3D
 {
 public:
+    static std::unique_ptr<GLRenderer> New() noexcept;
     ~GLRenderer() override;
     void Reset(GPU& gpu) override;
 
@@ -39,21 +39,20 @@ public:
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
 
-    void VCount144(GPU& gpu) override {};
+    void VCount144(GPU& gpu) override;
     void RenderFrame(GPU& gpu) override;
     void Stop(const GPU& gpu) override;
     u32* GetLine(int line) override;
 
-    void SetupAccelFrame() override;
-    void PrepareCaptureFrame() override;
-    void Blit(const GPU& gpu) override;
+    //void SetupAccelFrame() override;
+    //void PrepareCaptureFrame() override;
+    //void Blit(const GPU& gpu) override;
 
-    void BindOutputTexture(int buffer) override;
+    //void BindOutputTexture(int buffer) override;
 
-    static std::unique_ptr<GLRenderer> New() noexcept;
 private:
     // Used by New()
-    GLRenderer(GLCompositor&& compositor) noexcept;
+    GLRenderer() noexcept;//GLCompositor&& compositor) noexcept;
 
     // GL version requirements
     // * texelFetch: 3.0 (GLSL 1.30)     (3.2/1.50 for MS)
@@ -73,7 +72,7 @@ private:
         u32 RenderKey;
     };
 
-    GLCompositor CurGLCompositor;
+    //GLCompositor CurGLCompositor;
     RendererPolygon PolygonList[2048] {};
 
     bool BuildRenderShader(u32 flags, const std::string& vs, const std::string& fs);
