@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - master
+      - blackmagic3
       - ci/*
   pull_request:
     branches:
       - master
+      - blackmagic3
 
 env:
   MELONDS_GIT_BRANCH: ${{ github.ref }}
