@@ -2,6 +2,7 @@
 
 uniform sampler2DArray BGLayerTex;
 uniform sampler2D _3DLayerTex;
+uniform sampler2DArray CaptureTex;
 
 struct sScanline
 {
@@ -31,15 +32,18 @@ struct sBGConfig
 layout(std140) uniform uConfig
 {
     int uVRAMMask;
+    ivec4 uCaptureMask[8];
     sBGConfig uBGConfig[4];
 };
 
 uniform int uScaleFactor;
+uniform int uCurUnit;
 uniform int uCurBG;
 
 smooth in vec2 fTexcoord;
 
 out vec4 oColor;
+out vec4 oCaptureColor;
 
 vec4 GetBGLayerPixel(int layer, vec2 coord)
 {
@@ -51,21 +55,24 @@ void main()
     vec2 coord;
     int line = int(fTexcoord.y);
     vec2 bgsize = vec2(uBGConfig[uCurBG].Size);
+    vec4 _3dcolor = vec4(0);
 
-    if (uBGConfig[uCurBG].Type == 6)
+    if ((uCurUnit == 0) && (uCurBG == 0))
     {
-        // 3D layer
         int hofs = uScanline[line].BGOffset[uCurBG].x & 0x1FF;
         hofs -= ((hofs & 0x100) << 1);
         coord = vec2(float(hofs), 0) + fTexcoord;
 
-        if (coord.x < 0 || coord.x >= 256)
-        {
-            oColor = vec4(0);
-            return;
-        }
+        if (coord.x >= 0 && coord.x < 256)
+            _3dcolor = texelFetch(_3DLayerTex, ivec2(coord * uScaleFactor), 0);
 
-        oColor = texelFetch(_3DLayerTex, ivec2(coord * uScaleFactor), 0);
+        oCaptureColor = _3dcolor;
+    }
+
+    if (uBGConfig[uCurBG].Type == 6)
+    {
+        // 3D layer
+        oColor = _3dcolor;
         return;
     }
 
@@ -83,8 +90,6 @@ void main()
         coord = vec2(uScanline[line].BGOffset[uCurBG]) + fTexcoord;
     }
 
-    // TODO also provision for hi-res capture
-
     if (uBGConfig[uCurBG].Clamp)
     {
         if (any(lessThan(coord, vec2(0))) || any(greaterThanEqual(coord, bgsize)))
@@ -96,6 +101,36 @@ void main()
     else
     {
         coord = mod(coord, bgsize);
+    }
+
+    if ((uBGConfig[uCurBG].Type == 5) && (uBGConfig[uCurBG].Size.x <= 256))
+    {
+        // direct bitmap BG
+        // check for a display capture
+
+        ivec2 icoord = ivec2(coord);
+        int mapoffset = uBGConfig[uCurBG].MapOffset +
+            ((icoord.x +
+            (icoord.y * uBGConfig[uCurBG].Size.x)) << 1);
+
+        int block = (mapoffset >> 14) & (uVRAMMask >> 4);
+        int cap = uCaptureMask[block >> 2][block & 0x3];
+        if (cap != -1)
+        {
+            if (uBGConfig[uCurBG].Size.x == 128)
+            {
+                icoord = ivec2(coord * uScaleFactor);
+                oColor = texelFetch(CaptureTex, ivec3(icoord, cap), 0);
+            }
+            else
+            {
+                coord.y += (uBGConfig[uCurBG].MapOffset >> 9);
+                coord.y = mod(coord.y, 256);
+                icoord = ivec2(coord * uScaleFactor);
+                oColor = texelFetch(CaptureTex, ivec3(icoord, cap>>2), 0);
+            }
+            return;
+        }
     }
 
     oColor = GetBGLayerPixel(uCurBG, coord);

@@ -66,6 +66,7 @@ private:
 
     GLuint LayerShader;
     GLint LayerScaleULoc;
+    GLint LayerCurUnitULoc;
     GLint LayerCurBGULoc;
     GLuint ScanlineConfigUBO;
 
@@ -108,6 +109,7 @@ private:
         {
             u32 uVRAMMask;
             u32 __pad0[3];
+            u32 uCaptureMask[32];
             struct sBGConfig
             {
                 u32 Size[2];
@@ -123,8 +125,10 @@ private:
 
         struct sSpriteConfig
         {
+            u32 uScaleFactor;
             u32 uVRAMMask;
-            u32 __pad0[3];
+            u32 __pad0[2];
+            u32 uCaptureMask[32];
             s32 uRotscale[32][4];
             struct sOAM
             {
@@ -173,6 +177,8 @@ private:
         u16 OAM[512];
 
     } UnitState[2];
+
+    GLuint CaptureInputTex;
 
     struct sFinalPassConfig
     {
@@ -226,6 +232,30 @@ private:
     GLuint FPOutputTex[2][2];               // final output
     GLuint FPOutputFB[2];
 
+    struct sCaptureConfig
+    {
+        u32 uCaptureSize[2];
+        u32 uScaleFactor;
+        u32 uSrcBOffset;
+        u32 uDstOffset;
+        u32 uDstMode;
+        u32 uBlendFactors[2];
+    } CaptureConfig;
+
+    GLuint CaptureShader;
+    GLuint CaptureConfigUBO;
+
+    GLuint CaptureVtxBuffer;
+    GLuint CaptureVtxArray;
+
+    GLuint CaptureOutput256FB[4];
+    GLuint CaptureOutput256Tex;
+    GLuint CaptureOutput128FB[16];
+    GLuint CaptureOutput128Tex;
+
+    GLuint CaptureSyncFB;
+    GLuint CaptureSyncTex;
+
     //GLuint test;
 
     u32* LineAttribBuffer;
@@ -235,21 +265,9 @@ private:
     //u32* Framebuffer[2][2];
     int BackBuffer;
 
-    u32* BGOBJLine;
-    // REMOVEME
-    //alignas(8) u32 BGOBJLine[256*3];
-    u32* _3DLine;
-
     u8 AuxUsageMask;
 
-    alignas(8) u8 WindowMask[256];
-
-    alignas(8) u32 OBJLine[2][256];
-    alignas(8) u8 OBJWindow[2][256];
-
-    u32 NumSprites[2];
-
-    u8* CurBGXMosaicTable;
+    /*u8* CurBGXMosaicTable;
     array2d<u8, 16, 256> MosaicTable = []() constexpr
     {
         array2d<u8, 16, 256> table {};
@@ -264,7 +282,7 @@ private:
         }
 
         return table;
-    }();
+    }();*/
 
     void UpdateScanlineConfig(Unit* unit, int line);
     void UpdateLayerConfig(Unit* unit);
@@ -279,7 +297,7 @@ private:
 
     void RenderScreen(Unit* unit, int ystart, int yend);
 
-    void DoCapture(u32 line, u32 width);
+    void DoCapture(Unit* unit);
 };
 
 }

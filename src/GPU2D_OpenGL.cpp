@@ -36,6 +36,8 @@ namespace melonDS::GPU2D
 #include "OpenGL_shaders/CompositorFS.h"
 #include "OpenGL_shaders/FinalPassVS.h"
 #include "OpenGL_shaders/FinalPassFS.h"
+#include "OpenGL_shaders/CaptureVS.h"
+#include "OpenGL_shaders/CaptureFS.h"
 
 // NOTE
 // for now, this is largely a reimplementation of the software 2D renderer
@@ -45,7 +47,7 @@ namespace melonDS::GPU2D
 std::unique_ptr<GLRenderer> GLRenderer::New(melonDS::GPU& gpu) noexcept
 {
     assert(glBindAttribLocation != nullptr);
-    GLuint shaderid[6];
+    GLuint shaderid[7];
 
     // TODO move those to GLInit()
     if (!OpenGL::CompileVertexFragmentProgram(shaderid[0],
@@ -59,7 +61,7 @@ std::unique_ptr<GLRenderer> GLRenderer::New(melonDS::GPU& gpu) noexcept
                                               kLayerVS, kLayerFS,
                                               "2DLayerShader",
                                               {{"vPosition", 0}},
-                                              {{"oColor", 0}}))
+                                              {{"oColor", 0}, {"oCaptureColor", 1}}))
         return nullptr;
 
     if (!OpenGL::CompileVertexFragmentProgram(shaderid[2],
@@ -80,14 +82,21 @@ std::unique_ptr<GLRenderer> GLRenderer::New(melonDS::GPU& gpu) noexcept
                                               kCompositorVS, kCompositorFS,
                                               "2DCompositorShader",
                                               {{"vPosition", 0}},
-                                              {{"oColor", 0}}))
+                                              {{"oColor", 0}, {"oCaptureColor", 1}}))
         return nullptr;
 
     if (!OpenGL::CompileVertexFragmentProgram(shaderid[5],
                                               kFinalPassVS, kFinalPassFS,
                                               "2DFinalPassShader",
                                               {{"vPosition", 0}, {"vTexcoord", 1}},
-                                              {{"oTopColor", 0}, {"oBottomColor", 1}, {"oCaptureColor", 2}}))
+                                              {{"oTopColor", 0}, {"oBottomColor", 1}}))
+        return nullptr;
+
+    if (!OpenGL::CompileVertexFragmentProgram(shaderid[6],
+                                              kCaptureVS, kCaptureFS,
+                                              "2DCaptureShader",
+                                              {{"vPosition", 0}, {"vTexcoord", 1}},
+                                              {{"oColor", 0}}))
         return nullptr;
 
     auto ret = std::unique_ptr<GLRenderer>(new GLRenderer(gpu));
@@ -97,6 +106,7 @@ std::unique_ptr<GLRenderer> GLRenderer::New(melonDS::GPU& gpu) noexcept
     ret->SpriteShader = shaderid[3];
     ret->CompositorShader = shaderid[4];
     ret->FPShaderID = shaderid[5];
+    ret->CaptureShader = shaderid[6];
     if (!ret->GLInit())
         return nullptr;
     return ret;
@@ -175,6 +185,18 @@ bool GLRenderer::GLInit()
     glEnableVertexAttribArray(2); // sprite index
     glVertexAttribIPointer(2, 1, GL_SHORT, 5 * sizeof(u16), (void*)(4 * sizeof(u16)));
 
+    // capture vertex data: 2x position, 2x texcoord
+    glGenBuffers(1, &CaptureVtxBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, CaptureVtxBuffer);
+    glBufferData(GL_ARRAY_BUFFER, 2 * 6 * 4 * sizeof(u16), nullptr, GL_STREAM_DRAW);
+
+    glGenVertexArrays(1, &CaptureVtxArray);
+    glBindVertexArray(CaptureVtxArray);
+    glEnableVertexAttribArray(0); // position
+    glVertexAttribIPointer(0, 2, GL_SHORT, 4 * sizeof(u16), (void*)0);
+    glEnableVertexAttribArray(1); // texcoord
+    glVertexAttribIPointer(1, 2, GL_SHORT, 4 * sizeof(u16), (void*)(2 * sizeof(u16)));
+
     for (int i = 0; i < 2; i++)
     {
         auto& state = UnitState[i];
@@ -186,6 +208,7 @@ bool GLRenderer::GLInit()
         int objheight = (i == 0) ? 256 : 128;
 
         state.LayerConfig.uVRAMMask = bgheight - 1;
+        state.SpriteConfig.uVRAMMask = objheight - 1;
 
         glGenTextures(1, &state.VRAMTex_BG);
         glBindTexture(GL_TEXTURE_2D, state.VRAMTex_BG);
@@ -254,6 +277,35 @@ bool GLRenderer::GLInit()
         glGenFramebuffers(1, &state.OutputFB);
     }
 
+    // generate texture to hold display capture input (source A)
+    glGenTextures(1, &CaptureInputTex);
+    glBindTexture(GL_TEXTURE_2D, CaptureInputTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+
+    // generate buffers to hold display capture output
+
+    glGenTextures(1, &CaptureOutput256Tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput256Tex);
+    glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+    glGenFramebuffers(4, CaptureOutput256FB);
+
+    glGenTextures(1, &CaptureOutput128Tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput128Tex);
+    glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+    glGenFramebuffers(16, CaptureOutput128FB);
+
+    glGenTextures(1, &CaptureSyncTex);
+    glBindTexture(GL_TEXTURE_2D, CaptureSyncTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 256, 256, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, nullptr);
+
+    glGenFramebuffers(1, &CaptureSyncFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, CaptureSyncFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureSyncTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+
     glGenBuffers(1, &LayerConfigUBO);
     glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO);
     static_assert((sizeof(sUnitState::sLayerConfig) & 15) == 0);
@@ -284,6 +336,12 @@ bool GLRenderer::GLInit()
     glBufferData(GL_UNIFORM_BUFFER, sizeof(sFinalPassConfig), nullptr, GL_STREAM_DRAW);
     glBindBufferBase(GL_UNIFORM_BUFFER, 14, FPConfigUBO);
 
+    glGenBuffers(1, &CaptureConfigUBO);
+    glBindBuffer(GL_UNIFORM_BUFFER, CaptureConfigUBO);
+    static_assert((sizeof(sCaptureConfig) & 15) == 0);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(sCaptureConfig), nullptr, GL_STREAM_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 15, CaptureConfigUBO);
+
 
     glUseProgram(LayerPreShader);
 
@@ -304,6 +362,8 @@ bool GLRenderer::GLInit()
     glUniform1i(uniloc, 0);
     uniloc = glGetUniformLocation(LayerShader, "_3DLayerTex");
     glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(LayerShader, "CaptureTex");
+    glUniform1i(uniloc, 2);
 
     uniloc = glGetUniformBlockIndex(LayerShader, "uScanlineConfig");
     glUniformBlockBinding(LayerShader, uniloc, 12);
@@ -311,6 +371,7 @@ bool GLRenderer::GLInit()
     glUniformBlockBinding(LayerShader, uniloc, 10);
 
     LayerScaleULoc = glGetUniformLocation(LayerShader, "uScaleFactor");
+    LayerCurUnitULoc = glGetUniformLocation(LayerShader, "uCurUnit");
     LayerCurBGULoc = glGetUniformLocation(LayerShader, "uCurBG");
 
 
@@ -329,6 +390,10 @@ bool GLRenderer::GLInit()
 
     uniloc = glGetUniformLocation(SpriteShader, "SpriteTex");
     glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(SpriteShader, "Capture128Tex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(SpriteShader, "Capture256Tex");
+    glUniform1i(uniloc, 2);
 
     uniloc = glGetUniformBlockIndex(SpriteShader, "uConfig");
     glUniformBlockBinding(SpriteShader, uniloc, 11);
@@ -356,7 +421,7 @@ bool GLRenderer::GLInit()
     for (int i = 0; i < 16; i++)
     {
         char var[32];
-        sprintf(var, "CaptureTex[%d]", i);
+        sprintf(var, "CaptureOutput256Tex[%d]", i);
         FPCaptureTexLoc[i] = glGetUniformLocation(FPShaderID, var);
     }*/
 
@@ -369,6 +434,18 @@ bool GLRenderer::GLInit()
 
     uniloc = glGetUniformBlockIndex(FPShaderID, "uFinalPassConfig");
     glUniformBlockBinding(FPShaderID, uniloc, 14);
+
+
+    glUseProgram(CaptureShader);
+
+    uniloc = glGetUniformLocation(CaptureShader, "InputTexA");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(CaptureShader, "InputTexB");
+    glUniform1i(uniloc, 1);
+
+    uniloc = glGetUniformBlockIndex(CaptureShader, "uCaptureConfig");
+    glUniformBlockBinding(CaptureShader, uniloc, 15);
+
 
     float vertices[12][4];
 #define SETVERTEX(i, x, y) \
@@ -503,10 +580,38 @@ void GLRenderer::SetScaleFactor(int scale)
     ScaleFactor = scale;
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
-    //ScreenH = (384+2) * scale;
 
-    for (auto& state : UnitState)
+    const GLenum fbassign2[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+
+    glBindTexture(GL_TEXTURE_2D, CaptureInputTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput256Tex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256*ScaleFactor, 256*ScaleFactor, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    for (int i = 0; i < 4; i++)
     {
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureOutput256FB[i]);
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureOutput256Tex, 0, i);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
+
+    glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput128Tex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 128*ScaleFactor, 128*ScaleFactor, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    for (int i = 0; i < 16; i++)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureOutput128FB[i]);
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureOutput128Tex, 0, i);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
+
+    for (int u = 0; u < 2; u++)
+    {
+        auto& state = UnitState[u];
+
+        state.SpriteConfig.uScaleFactor = ScaleFactor;
+
         glBindTexture(GL_TEXTURE_2D_ARRAY, state.FinalLayerTex);
         glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, ScreenW, ScreenH, 6, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
@@ -514,21 +619,34 @@ void GLRenderer::SetScaleFactor(int scale)
         {
             glBindFramebuffer(GL_FRAMEBUFFER, state.FinalLayerFB[i]);
             glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, state.FinalLayerTex, 0, i);
-            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+            if ((u == 0) && (i == 0))
+            {
+                glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, CaptureInputTex, 0);
+                glDrawBuffers(2, fbassign2);
+            }
+            else
+                glDrawBuffer(GL_COLOR_ATTACHMENT0);
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, state.FinalLayerFB[4]);
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, state.FinalLayerTex, 0, 4);
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, state.FinalLayerTex, 0, 5);
-        const GLenum fbassign[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
-        glDrawBuffers(2, fbassign);
+        glDrawBuffers(2, fbassign2);
 
         glBindTexture(GL_TEXTURE_2D, state.OutputTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
         glBindFramebuffer(GL_FRAMEBUFFER, state.OutputFB);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, state.OutputTex, 0);
-        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        if (u == 0)
+        {
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, CaptureInputTex, 0);
+            glDrawBuffers(2, fbassign2);
+        }
+        else
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
     }
 
     for (int i = 0; i < 2; i++)
@@ -544,13 +662,14 @@ void GLRenderer::SetScaleFactor(int scale)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         }
 
-        GLenum fbassign[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+        //GLenum fbassign[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
         glBindFramebuffer(GL_FRAMEBUFFER, FPOutputFB[i]);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FPOutputTex[i][0], 0);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, FPOutputTex[i][1], 0);
-        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, 0, 0);
+        //glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, 0, 0);
         //glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, test, 0);
-        glDrawBuffers(3, fbassign);
+        //glDrawBuffers(3, fbassign);
+        glDrawBuffers(2, fbassign2);
         //free(zeroPixels);
     }
 
@@ -826,6 +945,11 @@ void GLRenderer::VBlank(Unit* unitA, Unit* unitB)
     glBindVertexArray(FPVertexArrayID);
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 
+    if (unitA->CaptureLatch)
+    {
+        DoCapture(unitA);
+    }
+
     if (ActiveCapture != -1)
     {printf("we finished capturing to block %d\n", ActiveCapture);
         int block = ActiveCapture;
@@ -1007,6 +1131,14 @@ void GLRenderer::UpdateLayerConfig(Unit* unit)
     auto& state = UnitState[unit->Num];
     u32 dispcnt = unit->DispCnt;
 
+    // determine which parts of VRAM were used for captures
+    // TODO make this more efficient
+    for (u32 i = 0; i < (unit->Num ? 0x20000 : 0x80000); i += 0x4000)
+    {
+        int blk = unit->GetCaptureBlock_BG(i);
+        state.LayerConfig.uCaptureMask[i >> 14] = blk;
+    }
+
     u32 tilebase, mapbase;
     if (!unit->Num)
     {
@@ -1181,9 +1313,12 @@ void GLRenderer::UpdateOAM(Unit* unit, int ystart, int yend)
     //u16* oam = (u16*)&GPU.OAM[unit->Num ? 0x400 : 0];
     u16* oam = state.OAM;
 
-    if (unit->Num)
+    // determine which parts of VRAM were used for captures
+    // TODO make this more efficient
+    for (u32 i = 0; i < (unit->Num ? 0x20000 : 0x40000); i += 0x4000)
     {
-        printf("y=%03d-%03d: %04X:%04X:%04X\n", ystart, yend, oam[0], oam[1], oam[2]);
+        int blk = unit->GetCaptureBlock_OBJ(i);
+        cfg.uCaptureMask[i >> 14] = blk;
     }
 
     for (int i = 0; i < 32; i++)
@@ -1244,7 +1379,7 @@ void GLRenderer::UpdateOAM(Unit* unit, int ystart, int yend)
                 boundwidth <<= 1;
                 boundheight <<= 1;
             }
-if(unit->Num)printf("spr%d: x=%d y=%d w=%d h=%d\n", sprnum, xpos, ypos, boundwidth, boundheight);
+
             if (xpos <= -boundwidth)
                 continue;
 
@@ -1252,7 +1387,7 @@ if(unit->Num)printf("spr%d: x=%d y=%d w=%d h=%d\n", sprnum, xpos, ypos, boundwid
             bool yc1 = (((ypos&0xFF) + boundheight) > ystart) && ((ypos&0xFF) < yend);
             if (!(yc0 || yc1))
                 continue;
-if(unit->Num) printf("spr%d passed\n", sprnum);
+
             u32 sprmode = (attrib[0] >> 10) & 0x3;
             if (sprmode == 3)
             {
@@ -1365,9 +1500,9 @@ if(unit->Num) printf("spr%d passed\n", sprnum);
 
     glBindBuffer(GL_UNIFORM_BUFFER, SpriteConfigUBO);
     glBufferSubData(GL_UNIFORM_BUFFER,
-                    offsetof(sUnitState::sSpriteConfig, uRotscale),
-                    sizeof(cfg.uRotscale) + (state.NumSprites * sizeof(cfg.uOAM[0])),
-                    &cfg.uRotscale);
+                    0,
+                    offsetof(sUnitState::sSpriteConfig, uOAM) + (state.NumSprites * sizeof(cfg.uOAM[0])),
+                    &cfg);
 }
 
 void GLRenderer::UpdateCompositorConfig(Unit* unit)
@@ -1547,6 +1682,12 @@ void GLRenderer::RenderSprites(Unit* unit, bool window, int ystart, int yend)
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, state.SpriteTex);
 
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput128Tex);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput256Tex);
+
     glBindBuffer(GL_ARRAY_BUFFER, SpriteVtxBuffer);
     glBufferSubData(GL_ARRAY_BUFFER, 0, vtxnum * 5 * sizeof(u16), SpriteVtxData);
 
@@ -1557,6 +1698,7 @@ void GLRenderer::RenderSprites(Unit* unit, bool window, int ystart, int yend)
 void GLRenderer::RenderLayer(Unit* unit, int layer, int ystart, int yend)
 {
     auto& state = UnitState[unit->Num];
+    auto& cfg = state.LayerConfig.uBGConfig[layer];
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state.FinalLayerFB[layer]);
@@ -1568,12 +1710,25 @@ void GLRenderer::RenderLayer(Unit* unit, int layer, int ystart, int yend)
     glUniform1i(LayerCurBGULoc, layer);
 
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if ((unit->Num == 0) && (layer == 0) && unit->CaptureLatch && (unit->CaptureCnt & (1<<24)))
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    else
+        glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D_ARRAY, state.BGLayerTex);
 
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, _3DLayerTex);
+
+    if (cfg.Type == 5)
+    {
+        glActiveTexture(GL_TEXTURE2);
+        if (cfg.Size[0] == 128)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput128Tex);
+        else if (cfg.Size[0] == 256)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureOutput256Tex);
+    }
 
     glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
     glBindVertexArray(RectVtxArray);
@@ -1648,12 +1803,6 @@ void GLRenderer::RenderScreen(Unit* unit, int ystart, int yend)
         //glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1+16, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, TempPalBuffer);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1+16, GL_RED_INTEGER, GL_UNSIGNED_SHORT, TempPalBuffer);
 
-        glBindBuffer(GL_UNIFORM_BUFFER, SpriteConfigUBO);
-        glBufferSubData(GL_UNIFORM_BUFFER,
-                        offsetof(sUnitState::sSpriteConfig, uVRAMMask),
-                        sizeof(u32),
-                        &vrammask);
-
         int spr_ystart = state.LastSpriteLine;
 
         state.NumSprites = 0;
@@ -1676,6 +1825,7 @@ void GLRenderer::RenderScreen(Unit* unit, int ystart, int yend)
 
     // TODO not set this all the time!!
     glUniform1i(LayerScaleULoc, ScaleFactor);
+    glUniform1i(LayerCurUnitULoc, unit->Num);
 
     // update scanline config buffer
     glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO);
@@ -1703,6 +1853,10 @@ void GLRenderer::RenderScreen(Unit* unit, int ystart, int yend)
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if ((unit->Num == 0) && unit->CaptureLatch && (!(unit->CaptureCnt & (1<<24))))
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    else
+        glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
     glViewport(0, 0, ScreenW, ScreenH);
 
@@ -1718,7 +1872,7 @@ void GLRenderer::RenderScreen(Unit* unit, int ystart, int yend)
 void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len)
 {
     printf("GL: alloc capture in bank %d, start=%d len=%d\n", bank, start, len);
-
+#if 0
     int block = (bank << 2) | start;
     int cur = CaptureLastBuffer[block] ^ 1;
     auto& capbuf = CaptureBuffers[block][cur];
@@ -1755,11 +1909,64 @@ void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len)
     // map it to the renderer, so it will get filled in
     glBindFramebuffer(GL_FRAMEBUFFER, FPOutputFB[BackBuffer]);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, capbuf.Texture, 0);
+#endif
 }
 
 void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 {
     printf("SYNC VRAM CAPTURE: %d %d %d %d\n", bank, start, len, complete);
+
+    if (!complete)
+        printf("!!! READING VRAM AS IT IS BEING CAPTURED TO\n");
+
+    u8* vram = GPU.VRAM[bank];
+
+    if (len == 0) // 128x128
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureOutput128FB[(bank<<2) | start]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureSyncFB);
+        glBlitFramebuffer(0, 0, 128 * ScaleFactor, 128 * ScaleFactor,
+                          0, 0, 128, 128,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureSyncFB);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); // TODO remove me
+
+        glReadPixels(0, 0, 128, 128,
+                     GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &vram[start * 64 * 512]);
+
+        for (u32 j = start * 64; j < (start+1) * 64; j++)
+            GPU.VRAMDirty[bank][j] = true;
+    }
+    else
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureOutput256FB[bank]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureSyncFB);
+        glBlitFramebuffer(0, 0, 256 * ScaleFactor, 256 * ScaleFactor,
+                          0, 0, 256, 256,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureSyncFB);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); // TODO remove me
+
+        u32 pos = start;
+        for (u32 i = 0; i < len;)
+        {
+            u32 end = pos + len;
+            if (end > 4)
+                end = 4;
+
+            glReadPixels(0, pos * 64, 256, (end - pos) * 64,
+                         GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &vram[pos * 64 * 512]);
+
+            for (u32 j = pos * 64; j < end * 64; j++)
+                GPU.VRAMDirty[bank][j] = true;
+
+            i += (end - pos);
+            pos += (end - pos);
+            pos &= 3;
+        }
+    }
 }
 
 
@@ -1779,9 +1986,126 @@ void GLRenderer::SwapBuffers()
 }
 
 
-void GLRenderer::DoCapture(u32 line, u32 width)
+void GLRenderer::DoCapture(Unit* unit)
 {
-    // TODO
+    glUseProgram(CaptureShader);
+
+    u32 capcnt = unit->CaptureCnt;
+    u32 dstblock = (capcnt >> 16) & 0x3;
+    u32 dstoffset = (capcnt >> 18) & 0x3;
+    u32 capsize = (capcnt >> 20) & 0x3;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    if (capsize == 0)
+    {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureOutput128FB[(dstblock << 2) | dstoffset]);
+        glViewport(0, 0, 128*ScaleFactor, 128*ScaleFactor);
+
+        CaptureConfig.uCaptureSize[0] = 128;
+        CaptureConfig.uCaptureSize[1] = 128;
+    }
+    else
+    {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureOutput256FB[dstblock]);
+        glViewport(0, 0, 256*ScaleFactor, 256*ScaleFactor);
+
+        CaptureConfig.uCaptureSize[0] = 256;
+        CaptureConfig.uCaptureSize[1] = 64 * capsize;
+    }
+
+    CaptureConfig.uScaleFactor = ScaleFactor;
+
+    if ((!(capcnt & (1<<25))) && (((unit->DispCnt >> 16) & 0x2) != 2))
+        CaptureConfig.uSrcBOffset = 64 * ((capcnt >> 26) & 0x3);
+    else
+        CaptureConfig.uSrcBOffset = 0;
+
+    CaptureConfig.uDstOffset = 64 * ((capcnt >> 18) & 0x3);
+    CaptureConfig.uDstMode = (capcnt >> 29) & 0x3;
+    CaptureConfig.uBlendFactors[0] = std::min(capcnt & 0x1F, 16u);
+    CaptureConfig.uBlendFactors[1] = std::min((capcnt >> 8) & 0x1F, 16u);
+
+    glBindBuffer(GL_UNIFORM_BUFFER, CaptureConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(CaptureConfig), &CaptureConfig);
+
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, CaptureInputTex);
+
+    glActiveTexture(GL_TEXTURE1);
+    // TODO map something here!!
+
+    u16 vtxbuf[12 * 4];
+    u16* vptr = vtxbuf;
+    int numvtx;
+
+    if (capsize == 0)
+    {
+        // 128x128
+        *vptr++ = 0;   *vptr++ = 128; *vptr++ = 0;   *vptr++ = 128;
+        *vptr++ = 128; *vptr++ = 0;   *vptr++ = 128; *vptr++ = 0;
+        *vptr++ = 128; *vptr++ = 128; *vptr++ = 128; *vptr++ = 128;
+        *vptr++ = 0;   *vptr++ = 128; *vptr++ = 0;   *vptr++ = 128;
+        *vptr++ = 0;   *vptr++ = 0;   *vptr++ = 0;   *vptr++ = 0;
+        *vptr++ = 128; *vptr++ = 0;   *vptr++ = 128; *vptr++ = 0;
+
+        numvtx = 6;
+    }
+    else if ((dstoffset + capsize) > 4)
+    {
+        // 256xN, wraparound
+        u16 y0, y1, t0, t1;
+        u32 h0 = 4 - dstoffset;
+
+        y0 = dstoffset * 64;
+        y1 = 256;
+        t0 = 0;
+        t1 = h0 * 64;
+        *vptr++ = 0;   *vptr++ = y1; *vptr++ = 0;   *vptr++ = t1;
+        *vptr++ = 256; *vptr++ = y0; *vptr++ = 256; *vptr++ = t0;
+        *vptr++ = 256; *vptr++ = y1; *vptr++ = 256; *vptr++ = t1;
+        *vptr++ = 0;   *vptr++ = y1; *vptr++ = 0;   *vptr++ = t1;
+        *vptr++ = 0;   *vptr++ = y0; *vptr++ = 0;   *vptr++ = t0;
+        *vptr++ = 256; *vptr++ = y0; *vptr++ = 256; *vptr++ = t0;
+
+        y0 = 0;
+        y1 = (capsize - h0) * 64;
+        t0 = h0 * 64;
+        t1 = capsize * 64;
+        *vptr++ = 0;   *vptr++ = y1; *vptr++ = 0;   *vptr++ = t1;
+        *vptr++ = 256; *vptr++ = y0; *vptr++ = 256; *vptr++ = t0;
+        *vptr++ = 256; *vptr++ = y1; *vptr++ = 256; *vptr++ = t1;
+        *vptr++ = 0;   *vptr++ = y1; *vptr++ = 0;   *vptr++ = t1;
+        *vptr++ = 0;   *vptr++ = y0; *vptr++ = 0;   *vptr++ = t0;
+        *vptr++ = 256; *vptr++ = y0; *vptr++ = 256; *vptr++ = t0;
+
+        numvtx = 12;
+    }
+    else
+    {
+        // 256xN, no wraparound
+        u16 y0, y1, t0, t1;
+
+        y0 = dstoffset * 64;
+        y1 = (dstoffset + capsize) * 64;
+        t0 = 0;
+        t1 = capsize * 64;
+        *vptr++ = 0;   *vptr++ = y1; *vptr++ = 0;   *vptr++ = t1;
+        *vptr++ = 256; *vptr++ = y0; *vptr++ = 256; *vptr++ = t0;
+        *vptr++ = 256; *vptr++ = y1; *vptr++ = 256; *vptr++ = t1;
+        *vptr++ = 0;   *vptr++ = y1; *vptr++ = 0;   *vptr++ = t1;
+        *vptr++ = 0;   *vptr++ = y0; *vptr++ = 0;   *vptr++ = t0;
+        *vptr++ = 256; *vptr++ = y0; *vptr++ = 256; *vptr++ = t0;
+
+        numvtx = 6;
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, CaptureVtxBuffer);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, numvtx * 4 * sizeof(u16), vtxbuf);
+
+    glBindVertexArray(CaptureVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, numvtx);
 }
 
 
@@ -1827,12 +2151,6 @@ void GLRenderer::DrawSprites(u32 line, Unit* unit)
         glBindTexture(GL_TEXTURE_2D, state.PalTex_OBJ);
         //glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1+16, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, TempPalBuffer);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1+16, GL_RED_INTEGER, GL_UNSIGNED_SHORT, TempPalBuffer);
-
-        glBindBuffer(GL_UNIFORM_BUFFER, SpriteConfigUBO);
-        glBufferSubData(GL_UNIFORM_BUFFER,
-                        offsetof(sUnitState::sSpriteConfig, uVRAMMask),
-                        sizeof(u32),
-                        &vrammask);
 
         state.NumSprites = 0;
         UpdateOAM(unit, ystart, yend);
